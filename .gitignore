@@ -1,0 +1,7 @@
+src/.vs/
+**/*.dll
+**/*.lib
+src/SteamApi.*/
+src/x64/
+src/libs/*
+
