@@ -4,6 +4,7 @@
 
 #include <filesystem>
 #include <string>
+#include <unordered_map>
 
 
 
@@ -1114,43 +1115,58 @@ HINSTANCE steam_ddl_instance;
 
 typedef SteamAPICall_t(__fastcall* RequestLobbyList_t)(ISteamMatchmaking* pThis);
 RequestLobbyList_t TrueRequestLobbyList = nullptr;
+std::unordered_map<ISteamMatchmaking*, RequestLobbyList_t> hooked_interfaces;
 
 SteamAPICall_t __fastcall Hooked_RequestLobbyList(ISteamMatchmaking* pThis) {
     printf("[SteamApiLobbyFilterRemover] In Hooked_RequestLobbyList()\n");
-    TrueRequestLobbyList(pThis);
+
+    RequestLobbyList_t true_fun = TrueRequestLobbyList;
+    auto it = hooked_interfaces.find(pThis);
+
+    if (it != hooked_interfaces.end() && it->second)
+        true_fun = it->second;
+
+    true_fun(pThis);
     
     pThis->AddRequestLobbyListDistanceFilter(k_ELobbyDistanceFilterWorldwide);
     pThis->AddRequestLobbyListResultCountFilter(100);
 
-    return TrueRequestLobbyList(pThis);
+    return true_fun(pThis);
 }
 
 void SetupHooks(ISteamMatchmaking* pMatchmaking) {
     void** vtable = *(void***)pMatchmaking;
 
     int index = 4;
-    TrueRequestLobbyList = (RequestLobbyList_t)vtable[index];
+    RequestLobbyList_t true_fun = (RequestLobbyList_t)vtable[index];
 
-    DWORD oldProtect;
-    if (VirtualProtect(&vtable[index], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        vtable[index] = (void*)&Hooked_RequestLobbyList;
+    if (true_fun) {
+        if (true_fun != Hooked_RequestLobbyList) {
+            TrueRequestLobbyList = true_fun; // fallback
+            DWORD oldProtect;
 
-        VirtualProtect(&vtable[index], sizeof(void*), oldProtect, &oldProtect);
-        printf("[SteamApiLobbyFilterRemover] vtable index %d successfully swapped!\n", index);
+            if (VirtualProtect(&vtable[index], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                vtable[index] = (void*)&Hooked_RequestLobbyList;
+
+                VirtualProtect(&vtable[index], sizeof(void*), oldProtect, &oldProtect);
+                printf("[SteamApiLobbyFilterRemover] vtable index %d successfully swapped!\n", index);
+            }
+            else
+                printf("[SteamApiLobbyFilterRemover] failed to change vtable memory protection.\n");
+        }
+
+        hooked_interfaces[pMatchmaking] = TrueRequestLobbyList;
     }
-    else
-        printf("[SteamApiLobbyFilterRemover] failed to change vtable memory protection.\n");
 }
 
-ISteamMatchmaking* g_pMatchmaking;
-
 void InitializeMatchmakingHook(ISteamMatchmaking* pMatchmaking) {
-    static bool hooked = false;
-    if (pMatchmaking && !hooked) {
-        printf("[SteamApiLobbyFilterRemover] setting up hooks ...\n");
-        SetupHooks(pMatchmaking);
-        g_pMatchmaking = pMatchmaking;
-        hooked = true;
+    if (pMatchmaking) {
+        auto it = hooked_interfaces.find(pMatchmaking);
+
+        if (it == hooked_interfaces.end()) {
+            hooked_interfaces[pMatchmaking] = nullptr;
+            SetupHooks(pMatchmaking);
+        }
     }
 }
 
@@ -1176,31 +1192,16 @@ typedef void* (*SteamInternal_CreateInterface_t)(const char* ver);
 SteamInternal_CreateInterface_t TrueCreateInterface = nullptr;
 
 extern "C" __declspec(dllexport) void* Hooked_SteamInternal_CreateInterface(const char* ver) {
-    printf("[SteamApiLobbyFilterRemover] In  Hooked_SteamInternal_CreateInterface() !\n");
     void* pInterface = TrueCreateInterface(ver);
 
-    if (ver && strstr(ver, "SteamMatchmaking")) {
-        InitializeMatchmakingHook((ISteamMatchmaking*)pInterface);
+    if (ver) {
+        printf("[SteamApiLobbyFilterRemover] CreateInterface :: %s\n", ver);
+        if (strstr(ver, "SteamMatchmaking") || strstr(ver, "SteamMatchMaking009")) {
+            InitializeMatchmakingHook((ISteamMatchmaking*)pInterface);
+        }
     }
 
     return pInterface;
-}
-
-typedef void(* SteamInternal_ContextInit_t)(void* pContext);
-SteamInternal_ContextInit_t TrueContextInit = nullptr;
-
-void CALLBACK DelayedHookThread(LPVOID lpParam) {
-    Sleep(3000);
-    printf("[SteamApiLobbyFilterRemover] In  DelayedHookThread() !\n");
-
-    if (TrueSteamMatchmaking) {
-        ISteamMatchmaking* p = TrueSteamMatchmaking();
-        if (p) {
-            InitializeMatchmakingHook(p);
-        }
-    }
-    else
-        printf("[SteamApiLobbyFilterRemover] No TrueSteamMatchmaking() !\n");
 }
 
 typedef int32_t HSteamUser;
@@ -1212,8 +1213,7 @@ extern "C" __declspec(dllexport) void* Hooked_SteamInternal_FindOrCreateUserInte
 
     if (pszInterfaceVersion) {
         printf("[SteamApiLobbyFilterRemover] FindOrCreateUserInterface :: %s\n", pszInterfaceVersion);
-        if (strstr(pszInterfaceVersion, "SteamMatchMaking009")) {
-            printf("[SteamApiLobbyFilterRemover] about to call InitializeMatchmakingHook() ...\n");
+        if (strstr(pszInterfaceVersion, "SteamMatchmaking") || strstr(pszInterfaceVersion, "SteamMatchMaking009")) {
             InitializeMatchmakingHook((ISteamMatchmaking*)pInterface);
         }
     }
@@ -1225,7 +1225,6 @@ void SetupExportDetours() {
     TrueSteamMatchmaking = (SteamMatchmaking_t)GetProcAddress(steam_ddl_instance, "SteamAPI_ISteamClient_GetISteamMatchmaking");
     TrueSteamMatchmaking_v009 = (SteamMatchmaking_t)GetProcAddress(steam_ddl_instance, "SteamAPI_SteamMatchmaking_v009");
     TrueCreateInterface = (SteamInternal_CreateInterface_t)GetProcAddress(steam_ddl_instance, "SteamInternal_CreateInterface");
-    TrueContextInit = (SteamInternal_ContextInit_t)GetProcAddress(steam_ddl_instance, "SteamInternal_ContextInit");
     TrueFindOrCreateInterface = (SteamInternal_FindOrCreateUserInterface_t)GetProcAddress(steam_ddl_instance, "SteamInternal_FindOrCreateUserInterface");
 
     printf("[SteamApiLobbyFilterRemover] Detouring SteamMatchmaking() !\n");
